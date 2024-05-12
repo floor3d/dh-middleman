@@ -3,25 +3,31 @@ use clap::{App, Arg};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 // use serde_json::json;
-use num_traits;
+use num_traits::pow;
 use std::error::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{self, Duration};
 
 #[derive(Serialize, Deserialize, Debug)]
+struct Message {
+    message_type: String,
+    data: String,
+}
+#[derive(Debug)]
 struct CryptoParams {
-    #[serde(skip_serializing)]
-    #[serde(default)]
     a: u64,
     g: u64,
     p: u64,
     gamodp: u64,
-    #[serde(default)]
-    #[serde(skip_serializing)]
     sharedkey: u64,
 }
 
+impl Message {
+    fn new(message_type: String, data: String) -> Self {
+        Message { message_type, data }
+    }
+}
 impl CryptoParams {
     fn new(a: u64) -> Self {
         let g = 5;
@@ -43,6 +49,7 @@ impl CryptoParams {
 
     fn update_shared_key(&mut self, new_key: u64) {
         self.sharedkey = new_key;
+        println!("[+] Shared key updated to {}", new_key);
     }
 }
 
@@ -84,28 +91,62 @@ fn parse_port(port: &mut String, partner_port: &mut String) {
 }
 
 //TODO
-fn send_verifier(mut stream: TcpStream, params: &CryptoParams) {}
+async fn send_verifier(stream: &mut TcpStream, params: &CryptoParams) {
+    listen(stream, params).await;
+}
 
 // update shared key and send gamodp and verifier, then verify, then pass execution
 // to listener
-fn handle_shared_key(mut stream: TcpStream, params: &CryptoParams, partner_params: &CryptoParams) {
-    let shared_key: u64 = pow(partner_params.gamodp, a);
+async fn handle_shared_key(
+    stream: &mut TcpStream,
+    params: &mut CryptoParams,
+    partner_msg: &Message,
+) {
+    let partner_data: Result<u64, std::num::ParseIntError> = partner_msg.data.parse();
+    let mut partner_gamodp: u64 = 0;
+    match partner_data {
+        Ok(number) => partner_gamodp = number,
+        Err(_) => println!("Failed to parse the input as u64"),
+    }
+    let shared_key: u64 = pow(partner_gamodp, params.a as usize);
     params.update_shared_key(shared_key);
-    send_verifier(stream, params);
-    listen(stream, params);
+    send_verifier(stream, params).await;
 }
 
 //TODO
 // naively verify shared key
-fn verify_shared_key(stream, params: &CryptoParams) -> bool {
+fn verify_shared_key(stream: TcpStream, params: &CryptoParams) -> bool {
     return true;
 }
 
-// handle new stream 
-fn handle(mut stream: TcpStream, params: &CryptoParams) {
+// handle new stream
+fn handle(stream: &mut TcpStream, params: &CryptoParams, message: &Message) {
+    // let mut buffer = [0; 1024];
+    // loop {
+    //     match stream.read(&mut buffer) {
+    //         Ok(0) => {
+    //             // Connection closed by client
+    //             println!("Client disconnected");
+    //             break;
+    //         }
+    //         Ok(bytes_read) => {
+    //             // Process the received message
+    //             let received_message = &buffer[..bytes_read];
+    //             println!("Received: {}", String::from_utf8_lossy(received_message));
+    //             //TODO: add parse and respond
+    //         }
+    //         Err(e) => {
+    //             eprintln!("Error reading from client: {}", e);
+    //             break;
+    //         }
+    //     }
+    // }
+}
+
+async fn listen(stream: &mut TcpStream, params: &CryptoParams) {
     let mut buffer = [0; 1024];
     loop {
-        match stream.read(&mut buffer) {
+        match stream.read(&mut buffer).await {
             Ok(0) => {
                 // Connection closed by client
                 println!("Client disconnected");
@@ -116,25 +157,13 @@ fn handle(mut stream: TcpStream, params: &CryptoParams) {
                 let received_message = &buffer[..bytes_read];
                 println!("Received: {}", String::from_utf8_lossy(received_message));
                 //TODO: add parse and respond
+                let message: Message = serde_json::from_slice(&buffer[..bytes_read])
+                    .expect("Failed to deserialize message");
+                handle(stream, params, &message);
             }
             Err(e) => {
                 eprintln!("Error reading from client: {}", e);
                 break;
-            }
-        }
-}
-
-fn listen(mut stream: TcpStream, params: &CryptoParams) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                // Handle each incoming connection in a new thread
-                std::thread::spawn(move || {
-                    handle(stream, params);
-                });
-            }
-            Err(e) => {
-                eprintln!("Error accepting connection: {}", e);
             }
         }
     }
@@ -147,7 +176,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     parse_port(&mut port, &mut partner_port);
     let mut rng = rand::thread_rng(); // Get a random number generator
     let rand: u64 = rng.gen_range(2..20); // Generate a random u64
-    let params = CryptoParams::new(rand);
+    let mut params = CryptoParams::new(rand);
 
     let ip = format!("127.0.0.1:{}", port);
     let partner_ip = format!("127.0.0.1:{}", partner_port);
@@ -158,7 +187,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let listener = TcpListener::bind(ip).await?;
     println!("Listening on port {}", port);
-    let serialized = serde_json::to_string(&params).unwrap();
+    let msg_type = String::from("HELLO");
+    let data = format!("{}", params.gamodp);
+    let msg = Message::new(msg_type, data);
+    let serialized = serde_json::to_string(&msg).unwrap();
     tokio::select! {
         // Handle incoming connections
         Ok((mut stream, _)) = listener.accept() => {
@@ -173,11 +205,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         return;
                     }
                 };
-                let deserialized: CryptoParams = serde_json::from_slice(&buf[..n]).expect("Failed to deserialize message");
+                let deserialized: Message = serde_json::from_slice(&buf[..n]).expect("Failed to deserialize message");
                 println!("{:?}", deserialized);
                 // update shared key and send gamodp and verifier, then verify, then pass execution
                 // to listener
-                handle_shared_key(stream, &params, &deserialized);
+                handle_shared_key(&mut stream, &mut params, &deserialized).await;
 
             });
         }
@@ -189,7 +221,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("Connected");
                 stream.write_all(serialized.as_bytes()).await?;
                 println!("Sent!");
-                listen(stream, &params);
+                listen(&mut stream, &params).await;
             } else {
                 println!("Failed to connect");
             }
