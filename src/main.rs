@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{self, Duration};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Message {
     message_type: String,
     data: String,
@@ -90,8 +90,23 @@ fn parse_port(port: &mut String, partner_port: &mut String) {
         .expect("Invalid port format");
 }
 
-//TODO
+async fn send_message(stream: &mut TcpStream, message: &Message) {
+    let serialized = serde_json::to_string(message).unwrap();
+    match stream.write_all(serialized.as_bytes()).await {
+        Err(_) => {
+            println!("Failed to send verifier");
+        }
+        Ok(_) => {
+            println!("Sent verifier");
+        }
+    }
+}
+
 async fn send_verifier(stream: &mut TcpStream, params: &CryptoParams) {
+    let msg_type = String::from("VERIFY");
+    let data = "Please verify me".to_owned();
+    let msg = Message::new(msg_type, data);
+    send_message(stream, &msg).await;
     listen(stream, params).await;
 }
 
@@ -119,32 +134,26 @@ fn verify_shared_key(stream: TcpStream, params: &CryptoParams) -> bool {
     return true;
 }
 
-// handle new stream
-fn handle(stream: &mut TcpStream, params: &CryptoParams, message: &Message) {
-    // let mut buffer = [0; 1024];
-    // loop {
-    //     match stream.read(&mut buffer) {
-    //         Ok(0) => {
-    //             // Connection closed by client
-    //             println!("Client disconnected");
-    //             break;
-    //         }
-    //         Ok(bytes_read) => {
-    //             // Process the received message
-    //             let received_message = &buffer[..bytes_read];
-    //             println!("Received: {}", String::from_utf8_lossy(received_message));
-    //             //TODO: add parse and respond
-    //         }
-    //         Err(e) => {
-    //             eprintln!("Error reading from client: {}", e);
-    //             break;
-    //         }
+// handle message
+async fn handle(stream: &mut TcpStream, params: &CryptoParams, message: &Message) {
+    // let serialized = serde_json::to_string(message).unwrap();
+    // match stream.write_all(serialized.as_bytes()).await {
+    //     Ok(_) => {}
+    //     Err(_) => {
+    //         println!("Message failed to send! \n {:?}", message)
     //     }
     // }
+    if message.message_type == "VERIFY" {
+        println!("I have verified this shit");
+        let mut return_msg = message.clone();
+        return_msg.message_type = "VERIFY2".to_owned();
+        send_message(stream, message).await;
+    }
 }
 
 async fn listen(stream: &mut TcpStream, params: &CryptoParams) {
     let mut buffer = [0; 1024];
+    println!("I'm finna listen now");
     loop {
         match stream.read(&mut buffer).await {
             Ok(0) => {
@@ -159,7 +168,7 @@ async fn listen(stream: &mut TcpStream, params: &CryptoParams) {
                 //TODO: add parse and respond
                 let message: Message = serde_json::from_slice(&buffer[..bytes_read])
                     .expect("Failed to deserialize message");
-                handle(stream, params, &message);
+                handle(stream, params, &message).await;
             }
             Err(e) => {
                 eprintln!("Error reading from client: {}", e);
@@ -198,19 +207,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tokio::spawn(async move {
                 let mut buf = [0; 1024];
                 let n = match stream.read(&mut buf).await {
-                    Ok(0) => return,
+                    Ok(0) => 1,
                     Ok(n) => n,
                     Err(e) => {
                         eprintln!("failed to read from socket; err = {:?}", e);
                         return;
                     }
                 };
+                if n == 1 {
+                    println!("WTF JUST HAPPENED");
+                }
                 let deserialized: Message = serde_json::from_slice(&buf[..n]).expect("Failed to deserialize message");
                 println!("{:?}", deserialized);
                 // update shared key and send gamodp and verifier, then verify, then pass execution
                 // to listener
                 handle_shared_key(&mut stream, &mut params, &deserialized).await;
-
             });
         }
         // Timeout block
@@ -228,5 +239,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // println!("Gtg");
     Ok(())
 }
