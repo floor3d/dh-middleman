@@ -1,39 +1,55 @@
+extern crate aes;
+extern crate block_modes;
+extern crate block_padding;
+extern crate num_bigint;
+extern crate rand;
+
 use anyhow::Result;
 use clap::{App, Arg};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
-// use serde_json::json;
-use num_traits::pow;
+use aes::Aes256;
+use block_modes::block_padding::Pkcs7;
+use block_modes::{BlockMode, Ecb};
+use num_bigint::{BigInt, RandBigInt};
+use num_traits::Num;
+use rand::thread_rng;
+use crate::rand::Rng;
 use std::error::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{self, Duration};
 
+type Aes256Ecb = Ecb<Aes256, Pkcs7>;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Message {
     message_type: String,
     data: String,
+    encrypted_data: Vec<u8>,
 }
-#[derive(Debug)]
+#[derive(Clone)]
 struct CryptoParams {
-    a: u64,
-    g: u64,
-    p: u64,
-    gamodp: u64,
-    sharedkey: u64,
+    a: BigInt,
+    g: BigInt,
+    p: BigInt,
+    gamodp: BigInt,
+    sharedkey: Option<Vec<u8>>,
 }
 
 impl Message {
     fn new(message_type: String, data: String) -> Self {
-        Message { message_type, data }
+        let encrypted_data: Vec<u8> = Vec::new();
+        Message { message_type, data, encrypted_data}
     }
 }
 impl CryptoParams {
-    fn new(a: u64) -> Self {
-        let g = 5;
-        let p = 23;
-        let gamodp = Self::compute_gamodp(g, a, p);
-        let sharedkey = 0;
+    fn new() -> Self {
+        let p = BigInt::parse_bytes(b"23", 10).unwrap();
+        let g = BigInt::parse_bytes(b"5", 10).unwrap();
+        let mut rng = rand::thread_rng(); // Get a random number generator
+        let a = rng.gen_bigint_range(&BigInt::from(1), &p);
+        let gamodp = g.modpow(&a, &p);
+        let sharedkey = None;
         CryptoParams {
             a,
             g,
@@ -43,13 +59,29 @@ impl CryptoParams {
         }
     }
 
-    fn compute_gamodp(g: u64, a: u64, p: u64) -> u64 {
-        (g.pow(a as u32)) % p
+    fn update_shared_key(&mut self, new_key: Vec<u8>) {
+        self.sharedkey = Some(new_key);
+        println!("[+] Shared key updated");
     }
 
-    fn update_shared_key(&mut self, new_key: u64) {
-        self.sharedkey = new_key;
-        println!("[+] Shared key updated to {}", new_key);
+    fn encrypt(&mut self, data: &str) -> Vec<u8> {
+        if let Some(key) = &self.sharedkey {
+            let k = Aes256Ecb::new_from_slices(&key, Default::default()).unwrap();
+            return k.encrypt_vec(data.as_bytes()).clone();
+        } else {
+            println!("shared key is None");
+            return Vec::new();
+        }
+    }
+
+    fn decrypt(&mut self, ciphertext: &Vec<u8>) -> String {
+        if let Some(key) = &self.sharedkey {
+            let k = Aes256Ecb::new_from_slices(&key, Default::default()).unwrap();
+            return std::str::from_utf8(&k.decrypt_vec(ciphertext).unwrap()).unwrap().to_owned().clone();
+        } else {
+            println!("shared key is None");
+            return String::new();
+        }
     }
 }
 
@@ -103,7 +135,7 @@ async fn send_message(stream: &mut TcpStream, message: &Message) {
     }
 }
 
-async fn send_verifier(stream: &mut TcpStream, params: &CryptoParams) {
+async fn send_verifier(stream: &mut TcpStream, params: &mut CryptoParams) {
     let msg_type = String::from("VERIFY");
     let data = "Please verify me".to_owned();
     let msg = Message::new(msg_type, data);
@@ -118,52 +150,53 @@ async fn handle_shared_key(
     params: &mut CryptoParams,
     partner_msg: &Message,
 ) {
-    let partner_data: Result<u64, std::num::ParseIntError> = partner_msg.data.parse();
-    let mut partner_gamodp: u64 = 0;
-    match partner_data {
-        Ok(number) => partner_gamodp = number,
-        Err(_) => println!("Failed to parse the input as u64"),
-    }
-    let shared_key: u64 = pow(partner_gamodp, params.a as usize);
-    params.update_shared_key(shared_key);
+    let partner_gamodp = BigInt::from_str_radix(&partner_msg.data, 10).expect("Failed to parse BigInt from partner msg");
+    let shared_secret = partner_gamodp.modpow(&params.a, &params.p);
+    let shared_secret_bytes = shared_secret.to_bytes_be().1;
+
+    let key_bytes = {
+        let mut key = [0u8; 32];
+        let len = shared_secret_bytes.len().min(32);
+        key[..len].copy_from_slice(&shared_secret_bytes[..len]);
+        key
+    };
+
+    let key = key_bytes.to_vec();
+    params.update_shared_key(key);
     send_verifier(stream, params).await;
 }
 
 //TODO
 // naively verify shared key
-fn verify_shared_key(stream: TcpStream, params: &CryptoParams) -> bool {
+fn verify_shared_key(params: &mut CryptoParams, message: &Message) -> bool {
     return true;
 }
 
 // handle message
-async fn handle(stream: &mut TcpStream, params: &CryptoParams, message: &Message) {
-    // let serialized = serde_json::to_string(message).unwrap();
-    // match stream.write_all(serialized.as_bytes()).await {
-    //     Ok(_) => {}
-    //     Err(_) => {
-    //         println!("Message failed to send! \n {:?}", message)
-    //     }
-    // }
+async fn handle(stream: &mut TcpStream, params: &mut CryptoParams, message: &Message) {
     if message.message_type == "VERIFY" {
         println!("I have verified this shit");
         let mut return_msg = message.clone();
         return_msg.message_type = "VERIFY2".to_owned();
         send_message(stream, &return_msg).await;
     } else if message.message_type == "VERIFY2" {
-        println!("I have verified this shit");
+        if !verify_shared_key(params, message) {
+            println!("Failed to verify shared key. Screw that message!");
+        }
+        println!("I have verified this lowkey");
         let mut return_msg = message.clone();
         return_msg.message_type = "COMM".to_owned();
-        return_msg.data =
-            "Hello we hath verified and now are on to normal communication".to_owned();
+        let data = "Hello we hath verified and now are on to normal communication".to_owned();
+        return_msg.encrypted_data = params.encrypt(&data).to_vec();
         send_message(stream, &return_msg).await;
-        println!("Sent verify2 message");
     } else if message.message_type == "COMM" {
-        println!("[+] Received normal communication message");
-        println!("{:?}", message);
+        println!("[+] Received communication message");
+        let msg = params.decrypt(&message.encrypted_data);
+        println!("{}", msg);
     }
 }
 
-async fn listen(stream: &mut TcpStream, params: &CryptoParams) {
+async fn listen(stream: &mut TcpStream, params: &mut CryptoParams) {
     let mut buffer = [0; 1024];
     println!("I'm finna listen now");
     loop {
@@ -177,7 +210,6 @@ async fn listen(stream: &mut TcpStream, params: &CryptoParams) {
                 // Process the received message
                 let received_message = &buffer[..bytes_read];
                 println!("Received: {}", String::from_utf8_lossy(received_message));
-                //TODO: add parse and respond
                 let message: Message = serde_json::from_slice(&buffer[..bytes_read])
                     .expect("Failed to deserialize message");
                 handle(stream, params, &message).await;
@@ -196,28 +228,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut port: String = String::new();
     let mut partner_port: String = String::new();
     parse_port(&mut port, &mut partner_port);
-    let mut rng = rand::thread_rng(); // Get a random number generator
-    let rand: u64 = rng.gen_range(2..15); // Generate a random u64
-    let mut params = CryptoParams::new(rand);
+    let mut params = CryptoParams::new();
+    let mut rng = thread_rng();
 
     let ip = format!("127.0.0.1:{}", port);
     let partner_ip = format!("127.0.0.1:{}", partner_port);
-    let mut rng = rand::thread_rng();
-    // sleep for 5 or more seconds, which gives time for the attacker to impersonate one of them
-    let timeout_duration = rng.gen_range(Duration::from_secs(5)..Duration::from_secs(15));
+    // sleep for 5 or more seconds, which gives time for the attacker to impersonate >:)
+    let timeout_duration = rng.gen_range(Duration::from_secs(5)..Duration::from_secs(10));
+
     println!("Listening for {:?} seconds...", timeout_duration);
 
     let listener = TcpListener::bind(ip).await?;
     println!("Listening on port {}", port);
-    let msg_type = String::from("HELLO");
-    let data = format!("{}", params.gamodp);
-    let msg = Message::new(msg_type, data);
-    let serialized = serde_json::to_string(&msg).unwrap();
     tokio::select! {
         // Handle incoming connections
         Ok((mut stream, _)) = listener.accept() => {
             println!("Received a connection");
-            // tokio::spawn(async move {
             let mut buf = [0; 1024];
             let n = match stream.read(&mut buf).await {
                 Ok(0) => 1,
@@ -235,17 +261,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // update shared key and send gamodp and verifier, then verify, then pass execution
             // to listener
             handle_shared_key(&mut stream, &mut params, &deserialized).await;
-            // });
         }
         // Timeout block
         _ = time::sleep(timeout_duration) => {
             println!("Timeout reached!");
             println!("Sending data to {}!", partner_ip);
+            let msg_type = String::from("HELLO");
+            let data = format!("{}", params.gamodp);
+            let msg = Message::new(msg_type, data);
+            let serialized = serde_json::to_string(&msg).unwrap();
             if let Ok(mut stream) = TcpStream::connect(partner_ip).await {
                 println!("Connected");
                 stream.write_all(serialized.as_bytes()).await?;
                 println!("Sent!");
-                listen(&mut stream, &params).await;
+                listen(&mut stream, &mut params).await;
             } else {
                 println!("Failed to connect");
             }
