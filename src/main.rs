@@ -137,13 +137,6 @@ fn verify_shared_key(stream: TcpStream, params: &CryptoParams) -> bool {
 
 // handle message
 async fn handle(stream: &mut TcpStream, params: &CryptoParams, message: &Message) {
-    // let serialized = serde_json::to_string(message).unwrap();
-    // match stream.write_all(serialized.as_bytes()).await {
-    //     Ok(_) => {}
-    //     Err(_) => {
-    //         println!("Message failed to send! \n {:?}", message)
-    //     }
-    // }
     if message.message_type == "VERIFY" {
         println!("I have verified this shit");
         let mut return_msg = message.clone();
