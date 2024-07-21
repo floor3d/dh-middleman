@@ -4,6 +4,7 @@ extern crate block_padding;
 extern crate num_bigint;
 extern crate rand;
 
+use std::thread;
 use crate::rand::Rng;
 use aes::Aes256;
 use anyhow::Result;
@@ -66,6 +67,7 @@ impl CryptoParams {
     fn update_shared_key(&mut self, new_key: Vec<u8>) {
         self.sharedkey = Some(new_key);
         println!("[+] Shared key updated");
+        println!("{:?}", self.sharedkey);
     }
 
     fn encrypt(&mut self, data: &str) -> Vec<u8> {
@@ -142,18 +144,17 @@ async fn send_message(stream: &mut TcpStream, message: &Message) {
     }
 }
 
-async fn send_verifier(stream: &mut TcpStream, params: &mut CryptoParams) {
-    let msg_type = String::from("VERIFY");
-    let data = "Please verify me".to_owned();
+// We have created our shared key. Now, we need to give them our gamodp so they can calc it too
+async fn send_key_agreement(stream: &mut TcpStream, params: &mut CryptoParams) {
+    let msg_type = String::from("AGREE");
+    let data = format!("{}", params.gamodp);
+
     let msg = Message::new(msg_type, data);
     send_message(stream, &msg).await;
     listen(stream, params).await;
 }
 
-// update shared key and send gamodp and verifier, then verify, then pass execution
-// to listener
-async fn handle_shared_key(
-    stream: &mut TcpStream,
+async fn calc_and_update_shared_key(
     params: &mut CryptoParams,
     partner_msg: &Message,
 ) {
@@ -171,36 +172,54 @@ async fn handle_shared_key(
 
     let key = key_bytes.to_vec();
     params.update_shared_key(key);
-    send_verifier(stream, params).await;
+}
+
+// update shared key and send gamodp and verifier, then verify, then pass execution
+// to listener
+async fn handle_shared_key(
+    stream: &mut TcpStream,
+    params: &mut CryptoParams,
+    partner_msg: &Message,
+) {
+    calc_and_update_shared_key(params, partner_msg).await;
+    send_key_agreement(stream, params).await;
 }
 
 //TODO
 // naively verify shared key
-fn verify_shared_key(params: &mut CryptoParams, message: &Message) -> bool {
+fn verify_shared_key(_params: &mut CryptoParams, _message: &Message) -> bool {
     return true;
 }
 
 // handle message
 async fn handle(stream: &mut TcpStream, params: &mut CryptoParams, message: &Message) {
-    if message.message_type == "VERIFY" {
-        println!("I have verified this shit");
-        let mut return_msg = message.clone();
-        return_msg.message_type = "VERIFY2".to_owned();
+    if message.message_type == "AGREE" {
+        println!("Received AGREE Message, calculating shared key");
+        calc_and_update_shared_key(params, message).await;
+        let data = String::new();
+        let return_msg = Message::new("VERIFY".to_owned(), data);
         send_message(stream, &return_msg).await;
-    } else if message.message_type == "VERIFY2" {
+    } else if message.message_type == "VERIFY" {
         if !verify_shared_key(params, message) {
             println!("Failed to verify shared key. Screw that message!");
+            return;
         }
         println!("I have verified this lowkey");
-        let mut return_msg = message.clone();
-        return_msg.message_type = "COMM".to_owned();
+        let msg_data = String::new();
+        let mut return_msg = Message::new("COMM".to_owned(), msg_data);
         let data = "Hello we hath verified and now are on to normal communication".to_owned();
         return_msg.encrypted_data = params.encrypt(&data).to_vec();
         send_message(stream, &return_msg).await;
     } else if message.message_type == "COMM" {
         println!("[+] Received communication message");
         let msg = params.decrypt(&message.encrypted_data);
-        println!("{}", msg);
+        println!("Decrypted message: {}", msg);
+        thread::sleep(Duration::from_secs(2));
+        let msg_data = String::new();
+        let mut return_msg = Message::new("COMM".to_owned(), msg_data);
+        let data = "Yoooooo we comming for real".to_owned();
+        return_msg.encrypted_data = params.encrypt(&data).to_vec();
+        send_message(stream, &return_msg).await;
     }
 }
 
