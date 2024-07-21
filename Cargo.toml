@@ -7,9 +7,12 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-rand = "0.8"
+num-bigint = { version = "0.4.3", features = ["rand"] }
+rand = "0.8.5"
+aes = "0.7"
+block-modes = "0.8"
+block-padding = "0.3"
 clap = "3.0"
-num-bigint = "0.4"
 num-traits = "0.2.14"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
