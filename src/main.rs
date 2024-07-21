@@ -5,6 +5,7 @@ extern crate num_bigint;
 extern crate rand;
 
 use std::thread;
+use std::collections::HashMap;
 use crate::rand::Rng;
 use aes::Aes256;
 use anyhow::Result;
@@ -24,6 +25,7 @@ type Aes256Ecb = Ecb<Aes256, Pkcs7>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Message {
+    identity: String,
     message_type: String,
     data: String,
     encrypted_data: Vec<u8>,
@@ -35,12 +37,25 @@ struct CryptoParams {
     p: BigInt,
     gamodp: BigInt,
     sharedkey: Option<Vec<u8>>,
+    identity: String,
 }
 
+struct Peer {
+    peer_identity: String,
+    peer_stream: &mut TcpStream,
+    peer_params: CryptoParams
+}
+
+struct AttackerData {
+    peers: Vec<Peer>,
+}
+
+
 impl Message {
-    fn new(message_type: String, data: String) -> Self {
+    fn new(identity: String, message_type: String, data: String) -> Self {
         let encrypted_data: Vec<u8> = Vec::new();
         Message {
+            identity,
             message_type,
             data,
             encrypted_data,
@@ -48,7 +63,7 @@ impl Message {
     }
 }
 impl CryptoParams {
-    fn new() -> Self {
+    fn new(identity: String) -> Self {
         let p = BigInt::parse_bytes(b"23", 10).unwrap();
         let g = BigInt::parse_bytes(b"5", 10).unwrap();
         let mut rng = rand::thread_rng(); // Get a random number generator
@@ -61,6 +76,7 @@ impl CryptoParams {
             p,
             gamodp,
             sharedkey,
+            identity
         }
     }
 
@@ -94,8 +110,18 @@ impl CryptoParams {
     }
 }
 
-fn parse_port(port: &mut String, partner_port: &mut String) {
-    let matches = App::new("My App")
+impl AttackerData {
+    // Create a new AttackerData instance
+    fn new() -> Self {
+        let peers: Vec<Peer> = Vec::new();
+        AttackerData {
+            peers
+        }
+    }
+}
+
+fn parse_port(port: &mut String, partner_port: &mut String, identity: &mut String) {
+    let matches = App::new("DH MITM")
         .version("1.0")
         .author("Evan")
         .about("Uses port")
@@ -117,6 +143,15 @@ fn parse_port(port: &mut String, partner_port: &mut String) {
                 .takes_value(true)
                 .required(true),
         )
+        .arg(
+            Arg::new("identity")
+                .short('i')
+                .long("identity")
+                .value_name("IDENTITY")
+                .help("Sets identity of user")
+                .takes_value(true)
+                .required(true),
+        )
         .get_matches();
 
     *port = matches
@@ -129,6 +164,11 @@ fn parse_port(port: &mut String, partner_port: &mut String) {
         .unwrap()
         .parse()
         .expect("Invalid port format");
+    *identity = matches
+        .value_of("identity")
+        .unwrap()
+        .parse()
+        .expect("Invalid identity");
 }
 
 async fn send_message(stream: &mut TcpStream, message: &Message) {
@@ -149,7 +189,7 @@ async fn send_key_agreement(stream: &mut TcpStream, params: &mut CryptoParams) {
     let msg_type = String::from("AGREE");
     let data = format!("{}", params.gamodp);
 
-    let msg = Message::new(msg_type, data);
+    let msg = Message::new(params.identity.clone(), msg_type, data);
     send_message(stream, &msg).await;
     listen(stream, params).await;
 }
@@ -197,7 +237,7 @@ async fn handle(stream: &mut TcpStream, params: &mut CryptoParams, message: &Mes
         println!("Received AGREE Message, calculating shared key");
         calc_and_update_shared_key(params, message).await;
         let data = String::new();
-        let return_msg = Message::new("VERIFY".to_owned(), data);
+        let return_msg = Message::new(params.identity.clone(), "VERIFY".to_owned(), data);
         send_message(stream, &return_msg).await;
     } else if message.message_type == "VERIFY" {
         if !verify_shared_key(params, message) {
@@ -206,7 +246,7 @@ async fn handle(stream: &mut TcpStream, params: &mut CryptoParams, message: &Mes
         }
         println!("I have verified this lowkey");
         let msg_data = String::new();
-        let mut return_msg = Message::new("COMM".to_owned(), msg_data);
+        let mut return_msg = Message::new(params.identity.clone(), "COMM".to_owned(), msg_data);
         let data = "Hello we hath verified and now are on to normal communication".to_owned();
         return_msg.encrypted_data = params.encrypt(&data).to_vec();
         send_message(stream, &return_msg).await;
@@ -216,7 +256,7 @@ async fn handle(stream: &mut TcpStream, params: &mut CryptoParams, message: &Mes
         println!("Decrypted message: {}", msg);
         thread::sleep(Duration::from_secs(2));
         let msg_data = String::new();
-        let mut return_msg = Message::new("COMM".to_owned(), msg_data);
+        let mut return_msg = Message::new(params.identity.clone(), "COMM".to_owned(), msg_data);
         let data = "Yoooooo we comming for real".to_owned();
         return_msg.encrypted_data = params.encrypt(&data).to_vec();
         send_message(stream, &return_msg).await;
@@ -254,14 +294,18 @@ async fn listen(stream: &mut TcpStream, params: &mut CryptoParams) {
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut port: String = String::new();
     let mut partner_port: String = String::new();
-    parse_port(&mut port, &mut partner_port);
-    let mut params = CryptoParams::new();
+    let mut identity: String = String::new();
+    parse_port(&mut port, &mut partner_port, &mut identity);
+    if identity.eq_ignore_ascii_case("Attacker") {
+        let attacker_data: AttackerData = AttackerData::new();
+        return;
+    }
+    let mut params = CryptoParams::new(identity);
     let mut rng = thread_rng();
 
     let ip = format!("127.0.0.1:{}", port);
     let partner_ip = format!("127.0.0.1:{}", partner_port);
-    // sleep for 5 or more seconds, which gives time for the attacker to impersonate >:)
-    let timeout_duration = rng.gen_range(Duration::from_secs(5)..Duration::from_secs(10));
+    let timeout_duration = rng.gen_range(Duration::from_secs(3)..Duration::from_secs(8));
 
     println!("Listening for {:?} seconds...", timeout_duration);
 
@@ -295,7 +339,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("Sending data to {}!", partner_ip);
             let msg_type = String::from("HELLO");
             let data = format!("{}", params.gamodp);
-            let msg = Message::new(msg_type, data);
+            let msg = Message::new(params.identity.clone(), msg_type, data);
             let serialized = serde_json::to_string(&msg).unwrap();
             if let Ok(mut stream) = TcpStream::connect(partner_ip).await {
                 println!("Connected");
